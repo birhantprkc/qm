@@ -81,7 +81,15 @@ import {
   type WorkBlock,
   fileContentUrl,
 } from "./core-bridge";
-import { buildTimeline, toolRowKind, type TimelineItem, type ToolPayload, type ToolRowModel } from "./timeline";
+import {
+  buildTimeline,
+  toolCategory,
+  toolRowKind,
+  toolExecutionOutput,
+  type TimelineItem,
+  type ToolPayload,
+  type ToolRowModel,
+} from "./timeline";
 import { CONNECTOR_NAMES, connectorLinksIn, stripConnectorLinks, type ConnectorLink } from "./connector-link";
 import { deepLinkPath, UI_BASE } from "./deep-link";
 import type { ChatSurface, ConvCtx } from "./conv-types";
@@ -2410,7 +2418,7 @@ export function createChatSurface(
   }
 
   function toolDetail(tool: string, call: ToolPayload, result: ToolPayload): string {
-    switch (tool) {
+    switch (toolCategory({ ...result, ...call, tool })) {
       case "execute":
         return call.command ? firstLine(call.command) : "";
       case "read":
@@ -2512,8 +2520,9 @@ export function createChatSurface(
     activity: ToolActivity | null,
   ): TemplateResult {
     const input = toolPayloadText(call);
-    const hasExecOutput = tool === "execute" && Boolean(result.stdout || result.stderr);
-    const output = toolPayloadText(result, hasExecOutput ? ["stdout", "stderr", "code", "timedOut"] : []);
+    const hasExecOutput =
+      toolCategory({ ...result, ...call, tool }) === "execute" && toolExecutionOutput(result) !== null;
+    const output = toolPayloadText(result, hasExecOutput ? ["stdout", "stderr", "code", "timedOut", "result"] : []);
     return html`<div class="tool-disclosure">
       ${toolPayloadCard("Input", input)} ${hasExecOutput ? execOutputCard(result, work, activity) : nothing}
       ${toolPayloadCard("Result", output)}
@@ -2534,7 +2543,7 @@ export function createChatSurface(
     const call = (row.call?.payload ?? {}) as ToolPayload;
     const result = (row.result?.payload ?? {}) as ToolPayload;
     const tool = call.tool ?? result.tool ?? "unknown";
-    const knownMeta = TOOL_META[tool];
+    const knownMeta = TOOL_META[toolCategory({ ...result, ...call, tool })];
     const meta = knownMeta ?? UNKNOWN_TOOL;
     const name = toolName(tool) || "Tool";
     const kind = toolRowKind(row, status);
@@ -2562,12 +2571,12 @@ export function createChatSurface(
   }
 
   function execOutputCard(result: ToolPayload, work: WorkBlock, activity: ToolActivity | null): TemplateResult {
-    const out = [result.stdout ?? "", result.stderr ? `[stderr]\n${result.stderr}` : ""].filter(Boolean).join("\n");
+    const out = toolExecutionOutput(result) ?? "";
     return html`<div class="code-card">
       <div class="code-card-head"><span class="code-card-lang">bash</span></div>
       <pre class="code-card-body">${out}</pre>
       <div class="code-card-foot">
-        exit ${result.code ?? 0}${result.timedOut ? " · timed out" : ""}
+        exit ${result.code ?? "unknown"}${result.timedOut ? " · timed out" : ""}
         ${
           activity?.truncated
             ? html`<button class="show-full-btn" type="button" @click=${() => void loadFullEntry(work, activity)}>

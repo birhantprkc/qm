@@ -1,6 +1,13 @@
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
 import { createDirectFileUploads, type DirectFileUploads } from "./files/direct-file-upload.ts";
 import { createPostgresFileUploadStore } from "./files/file-upload-store.ts";
+import {
+  createSandboxResources,
+  type SandboxResource,
+  type SandboxDefault,
+  type SandboxResources,
+  type SandboxResourceRollout,
+} from "./sandbox/sandbox-resources.ts";
 import { createModelVerifier, type ModelVerifier } from "./model/model-verification.ts";
 import type { probeModel } from "./harness/pi-harness.ts";
 import { createAwsRoleBroker, type AwsRoleBroker } from "./auth/aws-role-broker.ts";
@@ -444,6 +451,7 @@ export interface BuiltApp {
   sandbox: Sandbox;
   advisoryLock: AdvisoryLock;
   sandboxMigration: SandboxMigrationRunner;
+  sandboxResources: SandboxResources;
   blobTransfer: BlobTransferStore;
   files: FileArtifactStore;
   fileUploads?: DirectFileUploads;
@@ -500,6 +508,7 @@ export function buildApp(
   const membership: {
     canReadScope?: CanReadScope;
     canManageScope?: CanManageScope;
+    canUseSandboxScope?: CanManageScope;
     managesArtifactHome?: ManagesArtifactHome;
   } = {};
   const acl = createAclStore(config.databaseUrl ? createPostgresGrantStore(config.databaseUrl) : undefined, {
@@ -757,6 +766,9 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const e2bBodies = artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies");
+  const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
+  const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey) throw new Error("SANDBOX_BACKEND=e2b requires E2B_API_KEY");
@@ -778,7 +790,7 @@ export function buildApp(
       ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
       ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
-      store: artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies"),
+      store: e2bBodies,
       ...(e2b.snapshotS3Bucket
         ? { snapshots: createS3SnapshotStore({ bucket: e2b.snapshotS3Bucket, prefix: "e2b-home" }) }
         : {}),
@@ -827,7 +839,7 @@ export function buildApp(
       ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
       ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
-      store: artifactMap<StoredModalSandbox>("modal_sandbox_bodies"),
+      store: modalBodies,
       ...(modal.snapshotS3Bucket
         ? { snapshots: createS3SnapshotStore({ bucket: modal.snapshotS3Bucket, prefix: "modal-home" }) }
         : {}),
@@ -858,7 +870,7 @@ export function buildApp(
       ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
       ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
-      store: artifactMap<StoredMicrovm>("aws_sandbox_bodies"),
+      store: awsBodies,
       onError: sandboxOnError,
     });
   };
@@ -892,7 +904,57 @@ export function buildApp(
     if (name !== config.sandboxBackend && enabledBackends.has(name)) sandboxBackends[name] = buildBackend[name]();
   }
   const sandboxRoutes = artifactMap<SandboxRoute>("sandbox_routing");
+  const sandboxResources = createSandboxResources({
+    enabled: config.sandboxResourcesEnabled,
+    rollout: artifactMap<SandboxResourceRollout>("sandbox_resource_rollout"),
+    legacyScopes: async () => (await sessions.distinctScopes()).map((scope) => scope.scopeId),
+    legacySandboxes: async () => {
+      const [e2b, modal, aws] = await Promise.all([e2bBodies.entries(), modalBodies.entries(), awsBodies.entries()]);
+      return [
+        ...e2b.map(([scopeId, body]) => ({ scopeId, backend: "e2b" as const, machineId: body.sandboxId })),
+        ...modal.map(([scopeId, body]) => ({ scopeId, backend: "modal" as const, machineId: body.sandboxId })),
+        ...aws.map(([scopeId, body]) => ({ scopeId, backend: "aws" as const, machineId: body.microvmId })),
+      ];
+    },
+    records: artifactMap<SandboxResource>("sandbox_resources"),
+    defaults: artifactMap<SandboxDefault>("sandbox_defaults"),
+    routes: sandboxRoutes,
+    backends: sandboxBackends,
+    defaultBackend: config.sandboxBackend,
+    lock: advisoryLock,
+    beforeRetire: async (record) => {
+      if (
+        (await processes?.liveByScope(record.ownerScopeId))?.some(
+          (process) => !process.sandboxId || process.sandboxId === record.id,
+        )
+      )
+        throw new Error("stop this sandbox's background jobs before retiring it");
+    },
+    beforeDefaultChange: async (scopeId) => {
+      if ((await processes?.liveByScope(scopeId))?.some((process) => !process.sandboxId))
+        throw new Error(
+          "legacy background work has no saved sandbox target; finish or stop it before changing the default",
+        );
+    },
+    provisionOptions: async (scopeId) => {
+      const secret = config.capabilitySecret ?? config.signingSecret;
+      if (!secret) return {};
+      const egressToken = await mintCapabilityToken(
+        {
+          actorId: "system:sandbox-create",
+          scopeId,
+          aud: EGRESS_PROXY_AUD,
+          egress: egressClaimAllowingControlPlane({ allowedHosts: [] }, config.apiBaseUrl ?? "", true),
+          exp: Date.now() + CAPABILITY_TTL_MS,
+        },
+        secret,
+      );
+      return { egressToken };
+    },
+    canUseScope: (actorId, scopeId) => membership.canUseSandboxScope!(actorId, scopeId),
+  });
   const sandbox: Sandbox = createSandboxRouter({
+    resources: sandboxResources,
     backends: sandboxBackends,
     routes: sandboxRoutes,
     defaultBackend: config.sandboxBackend,
@@ -919,6 +981,7 @@ export function buildApp(
       );
       return { egressToken };
     },
+    withLegacyMutation: (scope, action) => sandboxResources.withLegacyMutation(scope, action),
     hasLiveWork: async (scope) => !!processes && (await processes.liveByScope(scope)).length > 0,
   });
   const secretSource =
@@ -1274,6 +1337,9 @@ export function buildApp(
   const currentScopeMembers = createCurrentScopeMembers({ managedGroups: projects, directory, identity });
   membership.canReadScope = canReadScope;
   membership.canManageScope = canManageScope;
+  membership.canUseSandboxScope = async (actorId, scopeId) =>
+    identity.isInternal(identity.classify(actorId)) &&
+    ((await admin.adminStatusOf(identity.classify(actorId))).isAdmin || (await canWriteScope(actorId, scopeId)));
   membership.managesArtifactHome = managesArtifactHome;
   const deployGitSecret = config.signingSecret;
   const deployGitBase = config.apiBaseUrl;
@@ -1415,6 +1481,7 @@ export function buildApp(
     files,
     sandbox,
     sandboxMigration,
+    sandboxResources,
     connectorTokens,
     modelGateway,
     auditLog,
@@ -2035,6 +2102,7 @@ export function buildApp(
     ...(dropResolution ? { fireDropResolution: dropResolution } : {}),
     sandbox,
     sandboxMigration,
+    sandboxResources,
     advisoryLock,
     blobTransfer,
     files,
@@ -2178,5 +2246,6 @@ export function serverDeps(
     sessionShareBytes: built.sessionShareBytes,
     environments: built.environments,
     sandboxMigration: built.sandboxMigration,
+    sandboxResources: built.sandboxResources,
   };
 }
