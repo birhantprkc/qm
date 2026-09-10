@@ -24,6 +24,8 @@ import { renderGatewayContext } from "./gateway-context.ts";
 import { deriveTurnOutcome, approvalBlocksInput } from "./turn-outcome.ts";
 import { applyPromptVars, loadProtocolFile, type PromptVars } from "../resolution/prompt-vars.ts";
 import { cleanBrandingLabel, resolveBranding } from "../resolution/branding.ts";
+import { resolveTurnContext } from "../resolution/turn-context.ts";
+import { renderSharingPosturePrompt } from "../resolution/sharing-posture.ts";
 import { resolveReachableChannel } from "../resolution/scope-reach.ts";
 import { reachEnqueue } from "../reach/reach.ts";
 import { turnDeliveryProvenance } from "../delivery/delivery-store.ts";
@@ -92,7 +94,7 @@ import {
 } from "../security/security-posture.ts";
 import { commandApprovalId, inputApprovalId } from "./approval-id.ts";
 import { createPerTurnStrategy } from "../memory/strategies/per-turn.ts";
-import { DEFAULT_MEMORY_POLICY, recallMemoryScopes, writableMemoryScope } from "../memory/policy.ts";
+import { DEFAULT_MEMORY_POLICY } from "../memory/policy.ts";
 import { createMemoryMap } from "../persistence/durable-map.ts";
 import { collectBlob, createMemoryBlobTransferStore } from "../persistence/blob-transfer.ts";
 import { createSkillMaterializer, skillsIndex, SKILLS_DIR } from "../skills/materialize.ts";
@@ -155,7 +157,7 @@ import { sleep } from "../util/async.ts";
 import { hashId } from "../util/crypto.ts";
 import { randomUUID } from "node:crypto";
 import { LRUCache } from "lru-cache";
-import type { SkillResolution, GrantedSkillRef } from "../skills/skill-store.ts";
+import type { SkillResolution } from "../skills/skill-store.ts";
 import type { Orchestrator, OrchestratorDeps, OrchestratorInput } from "./orchestrator/types.ts";
 import { isHarnessId, resolveModel, CODEX_SUBSCRIPTION_PROVIDER } from "../model/pi-models.ts";
 import type { ProviderKeys } from "../harness/pi-harness.ts";
@@ -171,13 +173,13 @@ import {
   filterConnectorSkills,
   isScreenableTextAttachment,
   loadTapeImage,
+  loadActiveBundles,
   recentPrincipalDeliveryNote,
   renderTitleTranscript,
   replayableRequest,
   stripAckPrefix,
   stripTurnBoilerplate,
   turnPostKeys,
-  visibleSkillScopes,
 } from "./orchestrator/turn-helpers.ts";
 import {
   currentTimeBlock,
@@ -503,6 +505,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const automatedTurn = input.origin.kind === "automation";
       const ambientTurn = input.origin.kind === "ambient";
       const humanTurn = input.origin.kind === "human";
+      const allInternal =
+        deps.identity.audienceIsAllInternal(conversation.audience) &&
+        (conversation.kind === "dm" ||
+          (!!conversation.publishMembers?.length && conversation.publishMembers.every((p) => p.type === "internal")));
+      const liveTurn = humanTurn && allInternal;
+      const authoredDetection =
+        input.origin.kind === "ambient" && input.origin.live === true && conversation.kind !== "dm";
+      const liveAuthorTurn = (humanTurn || authoredDetection) && allInternal;
       const messageTs = input.origin.kind === "human" ? input.origin.messageTs : undefined;
       const entryTs =
         input.origin.kind === "human" || input.origin.kind === "ambient" ? input.origin.entryTs : undefined;
@@ -920,42 +930,30 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (rwLayer && environmentId !== rwLayer.scopeId) rwLayer.scopeId = environmentId;
       for (const layer of resolution.layers) await deps.workspace.ensureScope(layer.scopeId);
 
-      const memoryScopeId = writableMemoryScope(resolution.layers, scopeId);
-      const recallScopes = useMemory ? recallMemoryScopes(memoryPolicy, resolution.layers, memoryScopeId) : [];
-      const memoryAccess =
-        (useMemory && memoryPolicy.capture !== "off") || recallScopes.length > 0
-          ? { ...(useMemory && memoryPolicy.capture !== "off" ? { write: memoryScopeId } : {}), read: recallScopes }
-          : undefined;
-      const skillScopes = visibleSkillScopes(resolution, scopeId);
-      const grantedSkills: GrantedSkillRef[] = (
-        await deps.acl
-          .sharedOfKindForAudience(
-            "skill",
-            conversation.audience,
-            scopeId,
-            resolution.orgScopeId,
-            principalEntitledToScope,
-          )
-          .catch(swallowAs("orchestrator: skill grants for audience", []))
-      ).map((g) => ({ id: parseRef(g.ref).id, ownerScopeId: g.ownerScopeId }));
-      const recalledSections: string[] = [];
-      let recallMs = 0;
-      for (const recallScope of recallScopes) {
-        const recallStart = Date.now();
-        const body = (
-          await deps.memory.recall(recallScope, {
-            query: input.text,
-            actorId: actor.id,
-            conversationScopeId: scopeId,
-            maxChars: 6_000,
-            ...(automatedTurn ? { autonomous: true } : {}),
-          })
-        ).trim();
-        recallMs += Date.now() - recallStart;
-        if (!body) continue;
-        recalledSections.push(recallScopes.length === 1 ? body : `### ${recallScope}\n${body}`);
-      }
-      const recalled = recalledSections.join("\n\n");
+      const context = await resolveTurnContext({
+        actor,
+        audience: conversation.audience,
+        acl: deps.acl,
+        origin: input.origin,
+        trustedLiveHuman: liveTurn,
+        targetScope: scopeId,
+        config: deps.config,
+        sessions: deps.sessions,
+        isCurrentSharedScopeMember: deps.isCurrentSharedScopeMember,
+        resolution,
+        memoryPolicy,
+        useMemory,
+        memory: deps.memory,
+        workspace: deps.workspace,
+        files: deps.files,
+        skills: deps.skills,
+        auditLog: deps.auditLog,
+      });
+      const { sharingSources, memoryScopeId, baseRecallScopes, memoryAccess } = context;
+      resolution.grantedHandles = context.listFiles();
+      const recallStart = Date.now();
+      const recalled = await context.recall();
+      const recallMs = Date.now() - recallStart;
       const isWeb = input.surface === "web";
       const isSlack = input.surface === "slack";
       const surfaceTool = input.surface ?? "slack";
@@ -989,6 +987,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       }
       const sharedCore = applyPromptVars(SHARED_CORE_MD, { botName, botHandle, orgName });
       let systemPrompt = `${modeFrame}\n\n${resolution.systemPrompt}\n\n${sharedCore}\n\n${renderSecurityPolicyPrompt(securityPolicy)}`;
+      const sharingPrompt = renderSharingPosturePrompt(actor, sharingSources);
+      if (sharingPrompt) systemPrompt += `\n\n${sharingPrompt}`;
       const scopeProfile = supportsScopeProfile(deps.sandbox)
         ? await deps.sandbox
             .profileFor(memoryScopeId)
@@ -1022,9 +1022,65 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             swallowAs("orchestrator: configured connector providers", []),
           )
         : [];
-      const visibleSkillsForTurn = async (): Promise<SkillResolution[]> =>
-        filterConnectorSkills((await deps.skills?.visibleFor(skillScopes, grantedSkills)) ?? [], configuredProviders);
+      const carriedSkillScreens = new Map<string, Promise<boolean>>();
+      const visibleSkillsForTurn = async (): Promise<SkillResolution[]> => {
+        const resolved = filterConnectorSkills(await context.listSkills(), configuredProviders);
+        const allowed: SkillResolution[] = [];
+        for (const entry of resolved) {
+          const skill = entry.skill;
+          if (!skill || !sharingSources.includes(skill.scopeId) || securityPolicy.inboundScreening !== "external") {
+            allowed.push(entry);
+            continue;
+          }
+          const snapshot = structuredClone(entry);
+          const bundles = structuredClone(
+            deps.skillBundles ? await loadActiveBundles(deps.skillBundles, [snapshot]).catch(() => null) : [],
+          );
+          const payload = JSON.stringify({ manifest: snapshot.skill!.manifest, bundles });
+          const key = hashId([skill.scopeId, skill.id, payload], 64);
+          let screen = carriedSkillScreens.get(key);
+          if (!screen) {
+            screen = (async () => {
+              if (bundles === null || Buffer.byteLength(payload, "utf8") > MAX_AUTO_ATTACHMENT_SCREEN_BYTES)
+                return false;
+              for (const chunk of securityScreenChunks("tool_result:shared_skill", payload)) {
+                const verdict = await classifySecurityData(chunk, actor.id, scopeId, recordScreenRequest, {
+                  hook: "tool_response",
+                  surface: "shared_skill",
+                  origin: input.origin.kind,
+                });
+                if (verdict?.decision !== "auto" || verdict.unscreened) return false;
+              }
+              return true;
+            })();
+            carriedSkillScreens.set(key, screen);
+          }
+          if ((await screen) && bundles) allowed.push({ ...snapshot, screenedBundles: bundles });
+          else
+            deps.auditLog.record({
+              at: Date.now(),
+              principalId: actor.id,
+              action: "sharing.skill_screen_blocked",
+              resource: `skill:${skill.id}`,
+              scopeLabel: scopeId,
+              status: "refused",
+              detail: JSON.stringify({ actor: actor.id, source: skill.scopeId, target: scopeId }),
+            });
+        }
+        return allowed;
+      };
       const visibleSkills = await visibleSkillsForTurn();
+      for (const entry of visibleSkills) {
+        if (!entry.skill || !sharingSources.includes(entry.skill.scopeId)) continue;
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actor.id,
+          action: "sharing.cross_context_read",
+          resource: `skill:${entry.skill.id}`,
+          scopeLabel: scopeId,
+          detail: JSON.stringify({ actor: actor.id, source: entry.skill.scopeId, target: scopeId }),
+        });
+      }
       const transferId = turnFileId(input.runId, input.attempt);
       const turnSessionDir = `${TURN_FILES_DIR}/${hashId([conversation.threadRef], 24)}`;
       const turnFilesDir = `${turnSessionDir}/${transferId}`;
@@ -1045,7 +1101,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (deps.deploymentLayer?.hints.length) {
         systemPrompt += `\n\n## Deployment tool hints\n${deps.deploymentLayer.hints.map((hint) => `- ${hint}`).join("\n")}`;
       }
-      if (visibleSkills.length) systemPrompt += `\n\n${skillsIndex(visibleSkills)}`;
+      if (visibleSkills.length) systemPrompt += `\n\n${skillsIndex(visibleSkills, sharingSources)}`;
       const gatewayBlock = renderGatewayContext(input.surface, input.gatewayContext);
       if (gatewayBlock) systemPrompt += `\n\n${gatewayBlock}`;
       const homeChannel =
@@ -1065,7 +1121,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       else if (conversation.channelName) memoryContext = `#${conversation.channelName}`;
       else if (conversation.kind === "group") memoryContext = "a group conversation";
       const memoryBlock = recalled
-        ? `\n\n## What you remember\nYou're in ${memoryContext}. A memory tagged \`(said in …)\` was stated in another context — apply it only if that tag matches here; untagged memories are general.\n\n${recalled}`
+        ? `\n\n## What you remember\nYou're in ${memoryContext}. Scope headings and \`(said in …)\` tags identify provenance. You may use facts from these included, authorized memories to answer this request; do not ask for them to be shared again merely because they came from another scope. Context-specific instructions and preferences still apply only to their source context unless the user says otherwise.\n\n${recalled}`
         : "";
 
       let onboardingBlock = "";
@@ -1268,14 +1324,6 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       perf.credsMs += Date.now() - credsStart;
       let sharedCredsBlock = "";
       let egressTokenForTurn: string | undefined;
-      const allInternal =
-        deps.identity.audienceIsAllInternal(conversation.audience) &&
-        (conversation.kind === "dm" ||
-          (!!conversation.publishMembers?.length && conversation.publishMembers.every((p) => p.type === "internal")));
-      const liveTurn = humanTurn && allInternal;
-      const authoredDetection =
-        input.origin.kind === "ambient" && input.origin.live === true && conversation.kind !== "dm";
-      const liveAuthorTurn = (humanTurn || authoredDetection) && allInternal;
       // Service credentials: one read of the org's credential list and one grant scan feed both
       // the env-delivery gate (below) and the broker token mint (further down). Same grants gate both.
       let serviceCredRecords: PublicServiceCredential[] = [];
@@ -1355,7 +1403,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           }
         }
         const memoryClaim = memoryAccess
-          ? { ...memoryAccess, ...(orgMemoryWrite ? { orgWrite: orgMemoryWrite } : {}) }
+          ? { ...memoryAccess, read: baseRecallScopes, ...(orgMemoryWrite ? { orgWrite: orgMemoryWrite } : {}) }
           : undefined;
         controlClaims = {
           ...scopeAttestation,
@@ -2108,6 +2156,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           layerCommandRules: () => layerCommandRules,
           authorizeCommand,
           grantedHandles: resolution.grantedHandles,
+          context,
           sharedMaterializeDir: turnSharedDir,
           workspace: deps.workspace,
           deploy: deps.deploy,
