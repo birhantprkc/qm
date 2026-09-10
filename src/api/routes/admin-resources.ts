@@ -631,12 +631,13 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
         return {
           error: `model ${modelId} isn't serviceable on this deployment: its provider key is not configured for the ${harnessId} harness`,
         };
-      await ctx.deps.config!.setRuntimeSelectionLatest(scope, {
+      const choice = {
         harnessId,
         modelId,
         effortLevel,
         fastMode: fastMode && harnessSupportsFastMode(harnessId) && fastModeModelIds().includes(modelId),
-      });
+      };
+      await ctx.deps.config!.setRuntimeSelectionLatest(scope, choice);
       return { ok: true };
     },
   },
